@@ -1,0 +1,13 @@
+outlook = sunny
+|  humidity = high: no (3)
+|  humidity = normal: yes (2)
+outlook = overcast: yes (4)
+outlook = rainy
+|  windy = TRUE: no (2)
+|  windy = FALSE: yes (3)
+
+IF outlook = sunny AND humidity = high THEN play = no
+IF outlook = sunny AND humidity = normal THEN play = yes
+IF outlook = overcast THEN play = yes
+IF outlook = rainy AND windy = TRUE THEN play = no
+IF outlook = rainy AND windy = FALSE THEN play = yes
