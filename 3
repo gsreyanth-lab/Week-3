@@ -1,0 +1,381 @@
+/*
+ * weka_classifiers.c
+ * ID3, Naive Bayes, k-NN (IBk) + evaluation metrics + rule extraction in C.
+ *
+ * Datasets : weather.nominal (embedded), iris (read from iris.csv)
+ * Compile  : gcc -O2 -o weka_cls weka_classifiers.c -lm
+ * Run      : ./weka_cls iris.csv
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+
+#define MAXN 200
+#define MAXA 8
+#define MAXV 4
+#define MAXC 3
+
+/* ------------------------------ dataset ---------------------------------- */
+typedef struct {
+    int n, na, nc;                 /* instances, attributes (no class), classes */
+    double x[MAXN][MAXA];          /* nominal values are stored as 0..nv-1      */
+    int y[MAXN];
+    int isnom[MAXA], nv[MAXA];
+    char aname[MAXA][24];
+    char vname[MAXA][MAXV][12];
+    char cname[MAXC][24];
+} Data;
+
+static void load_weather(Data *d) {
+    static const char *an[4]    = {"outlook", "temperature", "humidity", "windy"};
+    static const char *vn[4][3] = {{"sunny","overcast","rainy"}, {"hot","mild","cool"},
+                                   {"high","normal",""},         {"TRUE","FALSE",""}};
+    static const int nvs[4] = {3, 3, 2, 2};
+    /* outlook, temperature, humidity, windy, play (0=yes,1=no) */
+    static const int rows[14][5] = {
+        {0,0,0,1,1},{0,0,0,0,1},{1,0,0,1,0},{2,1,0,1,0},{2,2,1,1,0},
+        {2,2,1,0,1},{1,2,1,0,0},{0,1,0,1,1},{0,2,1,1,0},{2,1,1,1,0},
+        {0,1,1,0,0},{1,1,0,0,0},{1,0,1,1,0},{2,1,0,0,1}};
+    memset(d, 0, sizeof *d);
+    d->n = 14; d->na = 4; d->nc = 2;
+    for (int a = 0; a < 4; a++) {
+        strcpy(d->aname[a], an[a]); d->isnom[a] = 1; d->nv[a] = nvs[a];
+        for (int v = 0; v < nvs[a]; v++) strcpy(d->vname[a][v], vn[a][v]);
+    }
+    strcpy(d->cname[0], "yes"); strcpy(d->cname[1], "no");
+    for (int i = 0; i < 14; i++) {
+        for (int a = 0; a < 4; a++) d->x[i][a] = rows[i][a];
+        d->y[i] = rows[i][4];
+    }
+}
+
+static int load_iris(Data *d, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    memset(d, 0, sizeof *d);
+    const char *an[4] = {"sepallength","sepalwidth","petallength","petalwidth"};
+    d->na = 4;
+    for (int a = 0; a < 4; a++) strcpy(d->aname[a], an[a]);
+    char line[256], lab[64];
+    while (fgets(line, sizeof line, f) && d->n < MAXN) {
+        double v[4];
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%63[^\r\n]", &v[0], &v[1], &v[2], &v[3], lab) != 5) continue;
+        int c;
+        for (c = 0; c < d->nc; c++) if (!strcmp(d->cname[c], lab)) break;
+        if (c == d->nc) strcpy(d->cname[d->nc++], lab);
+        for (int a = 0; a < 4; a++) d->x[d->n][a] = v[a];
+        d->y[d->n++] = c;
+    }
+    fclose(f);
+    return d->n;
+}
+
+/* ------------------------------ helpers ---------------------------------- */
+static double entropy(const int *cnt, int tot, int nc) {
+    double e = 0;
+    if (!tot) return 0;
+    for (int c = 0; c < nc; c++)
+        if (cnt[c]) { double p = (double)cnt[c] / tot; e -= p * log2(p); }
+    return e;
+}
+
+/* ============================== ID3 ======================================= */
+typedef struct ID3 {
+    int attr, cls, n;              /* attr = -1 for a leaf */
+    struct ID3 *ch[MAXV];
+} ID3;
+
+static ID3 *id3_build(const Data *d, const int *idx, int m, int *used, int parent_cls) {
+    ID3 *t = calloc(1, sizeof *t);
+    t->attr = -1; t->n = m;
+    int cnt[MAXC] = {0};
+    for (int i = 0; i < m; i++) cnt[d->y[idx[i]]]++;
+    int best = parent_cls >= 0 ? parent_cls : 0;
+    if (m > 0) { best = 0; for (int c = 1; c < d->nc; c++) if (cnt[c] > cnt[best]) best = c; }
+    t->cls = best;
+    if (m == 0 || cnt[best] == m) return t;               /* empty or pure */
+
+    double base = entropy(cnt, m, d->nc), bg = -1;
+    int ba = -1;
+    for (int a = 0; a < d->na; a++) {
+        if (used[a]) continue;
+        double rem = 0;
+        for (int v = 0; v < d->nv[a]; v++) {
+            int cc[MAXC] = {0}, tot = 0;
+            for (int i = 0; i < m; i++) if ((int)d->x[idx[i]][a] == v) { cc[d->y[idx[i]]]++; tot++; }
+            rem += ((double)tot / m) * entropy(cc, tot, d->nc);
+        }
+        if (base - rem > bg + 1e-12) { bg = base - rem; ba = a; }
+    }
+    if (ba < 0) return t;                                   /* no attributes left */
+    t->attr = ba; used[ba] = 1;
+    for (int v = 0; v < d->nv[ba]; v++) {
+        int sub[MAXN], ns = 0;
+        for (int i = 0; i < m; i++) if ((int)d->x[idx[i]][ba] == v) sub[ns++] = idx[i];
+        t->ch[v] = id3_build(d, sub, ns, used, best);
+    }
+    used[ba] = 0;
+    return t;
+}
+
+static int id3_predict(const ID3 *t, const double *x) {
+    while (t->attr >= 0) {
+        const ID3 *c = t->ch[(int)x[t->attr]];
+        if (!c) break;
+        t = c;
+    }
+    return t->cls;
+}
+static void id3_free(ID3 *t) {
+    if (!t) return;
+    for (int v = 0; v < MAXV; v++) id3_free(t->ch[v]);
+    free(t);
+}
+
+static void id3_print(const Data *d, const ID3 *t, int depth) {
+    for (int v = 0; v < d->nv[t->attr]; v++) {
+        const ID3 *c = t->ch[v];
+        for (int k = 0; k < depth; k++) printf("|  ");
+        printf("%s = %s", d->aname[t->attr], d->vname[t->attr][v]);
+        if (c->attr < 0) printf(": %s (%d)\n", d->cname[c->cls], c->n);
+        else { printf("\n"); id3_print(d, c, depth + 1); }
+    }
+}
+
+static void id3_rules(const Data *d, const ID3 *t, int *pa, int *pv, int len) {
+    for (int v = 0; v < d->nv[t->attr]; v++) {
+        const ID3 *c = t->ch[v];
+        pa[len] = t->attr; pv[len] = v;
+        if (c->attr < 0) {
+            printf("IF ");
+            for (int i = 0; i <= len; i++)
+                printf("%s%s = %s", i ? " AND " : "", d->aname[pa[i]], d->vname[pa[i]][pv[i]]);
+            printf(" THEN play = %s   (%d instances)\n", d->cname[c->cls], c->n);
+        } else id3_rules(d, c, pa, pv, len + 1);
+    }
+}
+
+/* ============================ Naive Bayes ================================= */
+typedef struct {
+    double prior[MAXC];
+    double p[MAXA][MAXV][MAXC];          /* nominal: P(value | class) (Laplace) */
+    double mean[MAXA][MAXC], sd[MAXA][MAXC];
+} NB;
+
+static void nb_train(const Data *d, const int *idx, int m, NB *nb) {
+    int cc[MAXC] = {0};
+    for (int i = 0; i < m; i++) cc[d->y[idx[i]]]++;
+    for (int c = 0; c < d->nc; c++) nb->prior[c] = (cc[c] + 1.0) / (m + d->nc);
+    for (int a = 0; a < d->na; a++) {
+        if (d->isnom[a]) {
+            for (int c = 0; c < d->nc; c++)
+                for (int v = 0; v < d->nv[a]; v++) {
+                    int k = 0;
+                    for (int i = 0; i < m; i++)
+                        if (d->y[idx[i]] == c && (int)d->x[idx[i]][a] == v) k++;
+                    nb->p[a][v][c] = (k + 1.0) / (cc[c] + d->nv[a]);
+                }
+        } else {
+            for (int c = 0; c < d->nc; c++) {
+                double s = 0, ss = 0;
+                for (int i = 0; i < m; i++) if (d->y[idx[i]] == c) s += d->x[idx[i]][a];
+                double mu = cc[c] ? s / cc[c] : 0;
+                for (int i = 0; i < m; i++)
+                    if (d->y[idx[i]] == c) ss += (d->x[idx[i]][a] - mu) * (d->x[idx[i]][a] - mu);
+                double sd = cc[c] > 1 ? sqrt(ss / (cc[c] - 1)) : 0;
+                nb->mean[a][c] = mu; nb->sd[a][c] = sd < 1e-3 ? 1e-3 : sd;
+            }
+        }
+    }
+}
+
+static int nb_predict(const Data *d, const NB *nb, const double *x) {
+    int best = 0; double bl = -DBL_MAX;
+    for (int c = 0; c < d->nc; c++) {
+        double lp = log(nb->prior[c]);
+        for (int a = 0; a < d->na; a++) {
+            if (d->isnom[a]) lp += log(nb->p[a][(int)x[a]][c]);
+            else {
+                double z = (x[a] - nb->mean[a][c]) / nb->sd[a][c];
+                lp += -0.5 * z * z - log(nb->sd[a][c] * sqrt(2 * M_PI));
+            }
+        }
+        if (lp > bl) { bl = lp; best = c; }
+    }
+    return best;
+}
+
+static void nb_print(const Data *d, const NB *nb) {
+    printf("Naive Bayes Classifier (Laplace-smoothed)\n\n");
+    printf("%-22s", "");
+    for (int c = 0; c < d->nc; c++) printf("%-14s", d->cname[c]);
+    printf("\n%-22s", "Prior");
+    for (int c = 0; c < d->nc; c++) printf("%-14.3f", nb->prior[c]);
+    printf("\n");
+    for (int a = 0; a < d->na; a++)
+        for (int v = 0; v < d->nv[a]; v++) {
+            char lab[48];
+            snprintf(lab, sizeof lab, "%s=%s", d->aname[a], d->vname[a][v]);
+            printf("%-22s", lab);
+            for (int c = 0; c < d->nc; c++) printf("%-14.3f", nb->p[a][v][c]);
+            printf("\n");
+        }
+}
+
+/* ============================== k-NN (IBk) ================================ */
+static int knn_predict(const Data *d, const int *train, int nt, const double *x, int k,
+                       const double *mn, const double *mx) {
+    double bd[MAXN]; int bc[MAXN] = {0}, nb = 0;               /* sorted k-best list */
+    for (int t = 0; t < nt; t++) {
+        const double *y = d->x[train[t]];
+        double s = 0;
+        for (int a = 0; a < d->na; a++) {
+            double diff;
+            if (d->isnom[a]) diff = (x[a] != y[a]);
+            else diff = mx[a] > mn[a] ? (x[a] - y[a]) / (mx[a] - mn[a]) : 0;
+            s += diff * diff;
+        }
+        int pos = nb;
+        if (nb < k) nb++; else if (s >= bd[k - 1]) continue; else pos = k - 1;
+        while (pos > 0 && bd[pos - 1] > s) { bd[pos] = bd[pos - 1]; bc[pos] = bc[pos - 1]; pos--; }
+        bd[pos] = s; bc[pos] = d->y[train[t]];
+    }
+    int votes[MAXC] = {0}, best = bc[0];
+    for (int i = 0; i < nb; i++) votes[bc[i]]++;
+    for (int i = 0; i < nb; i++) if (votes[bc[i]] > votes[best]) best = bc[i];  /* ties -> nearest */
+    return best;
+}
+
+/* ========================= evaluation & metrics =========================== */
+typedef enum { M_ID3, M_NB, M_KNN } Method;
+
+static void make_folds(const Data *d, int nf, int *fold) {
+    int perm[MAXN];
+    for (int i = 0; i < d->n; i++) perm[i] = i;
+    srand(1);
+    for (int i = d->n - 1; i > 0; i--) { int j = rand() % (i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    int pos = 0;
+    for (int c = 0; c < d->nc; c++)
+        for (int i = 0; i < d->n; i++) if (d->y[perm[i]] == c) fold[perm[i]] = (pos++) % nf;
+}
+
+/* folds == 0 : train and test on the whole set; folds >= n : leave-one-out */
+static double evaluate(const Data *d, Method m, int k, int folds, int verbose) {
+    int n = d->n, nc = d->nc, fold[MAXN], nf;
+    if (folds == 0) { nf = 1; for (int i = 0; i < n; i++) fold[i] = 0; }
+    else if (folds >= n) { nf = n; for (int i = 0; i < n; i++) fold[i] = i; }
+    else { nf = folds; make_folds(d, nf, fold); }
+
+    int cm[MAXC][MAXC] = {{0}};
+    for (int f = 0; f < nf; f++) {
+        int train[MAXN], test[MAXN], nt = 0, ne = 0;
+        for (int i = 0; i < n; i++) {
+            if (folds == 0) { train[nt++] = i; test[ne++] = i; }
+            else if (fold[i] == f) test[ne++] = i;
+            else train[nt++] = i;
+        }
+        ID3 *tree = NULL; NB nb; double mn[MAXA], mx[MAXA];
+        if (m == M_ID3) { int used[MAXA] = {0}; tree = id3_build(d, train, nt, used, -1); }
+        if (m == M_NB)  nb_train(d, train, nt, &nb);
+        if (m == M_KNN)
+            for (int a = 0; a < d->na; a++) {
+                mn[a] = DBL_MAX; mx[a] = -DBL_MAX;
+                for (int i = 0; i < nt; i++) {
+                    if (d->x[train[i]][a] < mn[a]) mn[a] = d->x[train[i]][a];
+                    if (d->x[train[i]][a] > mx[a]) mx[a] = d->x[train[i]][a];
+                }
+            }
+        for (int i = 0; i < ne; i++) {
+            const double *x = d->x[test[i]];
+            int p = m == M_ID3 ? id3_predict(tree, x)
+                  : m == M_NB  ? nb_predict(d, &nb, x)
+                  : knn_predict(d, train, nt, x, k, mn, mx);
+            cm[d->y[test[i]]][p]++;
+        }
+        id3_free(tree);
+    }
+
+    int ok = 0, row[MAXC] = {0}, col[MAXC] = {0};
+    for (int a = 0; a < nc; a++) for (int b = 0; b < nc; b++) { row[a] += cm[a][b]; col[b] += cm[a][b]; }
+    for (int c = 0; c < nc; c++) ok += cm[c][c];
+    double po = (double)ok / n, pe = 0;
+    for (int c = 0; c < nc; c++) pe += ((double)row[c] / n) * ((double)col[c] / n);
+    double kappa = (po - pe) / (1 - pe);
+
+    if (verbose) {
+        printf("Correctly Classified Instances    %4d   %8.4f %%\n", ok, 100 * po);
+        printf("Incorrectly Classified Instances  %4d   %8.4f %%\n", n - ok, 100 * (1 - po));
+        printf("Kappa statistic                   %8.4f\n\n", kappa);
+        printf("=== Detailed Accuracy By Class ===\n\n");
+        printf("%8s %8s %9s %8s %10s   Class\n", "TP Rate", "FP Rate", "Precision", "Recall", "F-Measure");
+        double w[5] = {0};
+        for (int c = 0; c < nc; c++) {
+            double tp = cm[c][c];
+            double tpr  = row[c] ? tp / row[c] : 0;
+            double fpr  = (n - row[c]) ? (col[c] - tp) / (n - row[c]) : 0;
+            double prec = col[c] ? tp / col[c] : 0;
+            double f1   = (prec + tpr) ? 2 * prec * tpr / (prec + tpr) : 0;
+            printf("%8.3f %8.3f %9.3f %8.3f %10.3f   %s\n", tpr, fpr, prec, tpr, f1, d->cname[c]);
+            double wt = (double)row[c] / n;
+            w[0] += wt * tpr; w[1] += wt * fpr; w[2] += wt * prec; w[3] += wt * tpr; w[4] += wt * f1;
+        }
+        printf("%8.3f %8.3f %9.3f %8.3f %10.3f   Weighted Avg.\n\n", w[0], w[1], w[2], w[3], w[4]);
+        printf("=== Confusion Matrix ===\n\n");
+        for (int c = 0; c < nc; c++) printf("%5c", 'a' + c);
+        printf("   <-- classified as\n");
+        for (int a = 0; a < nc; a++) {
+            for (int b = 0; b < nc; b++) printf("%5d", cm[a][b]);
+            printf(" |  %c = %s\n", 'a' + a, d->cname[a]);
+        }
+    }
+    return 100 * po;
+}
+
+/* ================================ main ==================================== */
+int main(int argc, char **argv) {
+    Data w, ir;
+    load_weather(&w);
+
+    printf("################ 1. ID3 on weather.nominal ################\n\n");
+    int idx[MAXN], used[MAXA] = {0};
+    for (int i = 0; i < w.n; i++) idx[i] = i;
+    ID3 *tree = id3_build(&w, idx, w.n, used, -1);
+    printf("Id3\n\n");
+    id3_print(&w, tree, 0);
+    printf("\n--- Rules extracted from the tree (root-to-leaf paths) ---\n");
+    int pa[MAXA], pv[MAXA];
+    id3_rules(&w, tree, pa, pv, 0);
+    id3_free(tree);
+
+    printf("\n--- Evaluation: training set ---\n");
+    evaluate(&w, M_ID3, 0, 0, 1);
+    printf("\n--- Evaluation: leave-one-out (14 folds) ---\n");
+    evaluate(&w, M_ID3, 0, 14, 1);
+
+    printf("\n################ 2. Naive Bayes on weather.nominal ################\n\n");
+    NB nb; nb_train(&w, idx, w.n, &nb);
+    nb_print(&w, &nb);
+    printf("\n--- Evaluation: leave-one-out ---\n");
+    evaluate(&w, M_NB, 0, 14, 1);
+
+    if (argc > 1 && load_iris(&ir, argv[1])) {
+        printf("\n################ 3. iris: Naive Bayes, k-NN (10-fold CV) ################\n\n");
+        printf("Id3: Cannot handle numeric attributes!   (discretize iris first to use ID3)\n\n");
+        printf("--- Naive Bayes (Gaussian) ---\n");
+        evaluate(&ir, M_NB, 0, 10, 1);
+        printf("\n--- k-NN, k = 1 (IBk default, min-max normalised) ---\n");
+        evaluate(&ir, M_KNN, 1, 10, 1);
+
+        printf("\n=== Summary: stratified 10-fold CV accuracy on iris ===\n");
+        printf("%-22s %8s\n", "Classifier", "Accuracy");
+        printf("%-22s %7.2f%%\n", "Naive Bayes", evaluate(&ir, M_NB, 0, 10, 0));
+        int ks[3] = {1, 3, 5};
+        for (int i = 0; i < 3; i++) {
+            char name[32]; snprintf(name, sizeof name, "k-NN (k=%d)", ks[i]);
+            printf("%-22s %7.2f%%\n", name, evaluate(&ir, M_KNN, ks[i], 10, 0));
+        }
+    } else printf("\n(pass iris.csv as argument to run the iris experiments)\n");
+    return 0;
+}
